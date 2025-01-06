@@ -1,6 +1,7 @@
 import gradio as gr
 from langchain_anthropic import ChatAnthropic
 from langchain.prompts import PromptTemplate
+from langchain_google_community import GoogleSearchAPIWrapper
 from firecrawl import FirecrawlApp
 import yfinance as yf
 import pandas as pd
@@ -20,13 +21,10 @@ LANGCHAIN_ENDPOINT="https://eu.api.smith.langchain.com"
 LANGCHAIN_API_KEY=os.getenv("LANGSMITH_API_KEY")
 LANGCHAIN_PROJECT="EnhancedFinancialScanner"
 
-# API keys en configuratie
-CLAUDE_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
-
 # Initialize APIs
-firecrawl = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
-claude = ChatAnthropic(api_key=CLAUDE_API_KEY, model='claude-3-5-sonnet-20241022', verbose=True)
+firecrawl = FirecrawlApp(api_key=os.getenv("FIRECRAWL_API_KEY"))
+claude = ChatAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"), model='claude-3-5-sonnet-20241022', verbose=True)
+google = GoogleSearchAPIWrapper(google_api_key=os.getenv("GOOGLE_API_KEY"), google_cse_id=os.getenv("GOOGLE_CSE_ID"))
 
 # Configure logging
 logging.basicConfig(
@@ -42,6 +40,7 @@ class EnhancedFinancialScanner:
     def __init__(self):
         self.firecrawl = firecrawl
         self.claude = claude
+        self.search = google
         logger.info("Initialized EnhancedFinancialScanner")
         
         # Templates voor verschillende analyses
@@ -136,24 +135,67 @@ class EnhancedFinancialScanner:
             logger.error(f"Error creating summary: {e}")
             return "Error generating summary. Please check the detailed data tabs for information."
             
-    def get_news_sources(self, ticker: str) -> List[str]:
-        """Get a focused list of high-quality news sources using LLM."""
+    def get_news_sources(self, ticker: str, timeframe: str) -> List[str]:
+        """Get a focused list of high-quality news sources using Google Search and LLM evaluation."""
         try:
-            news_sources_prompt = """
-            For the financial instrument {ticker}, return a JSON object with exactly 3 news URLs.
-            Return the response in this exact format (no newlines or extra spaces):
+            # Calculate date range based on timeframe
+            end_date = datetime.now()
+            days = self.timeframe_to_days(timeframe)
+            start_date = end_date - timedelta(days=days)
+            
+            # Prepare search queries for different source types
+            search_queries = [
+                f"site:finance.yahoo.com {ticker} stock news",
+                f"site:reuters.com {ticker} company news",
+                f"(site:seekingalpha.com OR site:marketwatch.com OR site:bloomberg.com) {ticker} analysis"
+            ]
+            
+            # Sort by date parameters for Google Search API
+            sort_params = {
+                "dateRestrict": f"d{days}"  # Restrict to last X days
+            }
+            
+            # Collect potential URLs from search
+            potential_urls = []
+            for query in search_queries:
+                try:
+                    time.sleep(1)  # Rate limiting
+                    search_results = self.search.results(query, num_results=2)
+                    
+                    for result in search_results:
+                        url = result.get('link', '')
+                        if url and any(x in url.lower() for x in ['/news/', '/article/', '/analysis/']):
+                            potential_urls.append({
+                                'url': url,
+                                'title': result.get('title', ''),
+                                'snippet': result.get('snippet', '')
+                            })
+                except Exception as e:
+                    logger.error(f"Error in search query '{query}': {e}")
+                    continue
+
+            # Prepare the prompt with found URLs
+            news_sources_prompt = f"""
+            For the financial instrument {ticker}, analyze these potential news sources and return exactly 3 high-quality URLs.
+            
+            Found URLs:
+            {json.dumps(potential_urls, indent=2)}
+            
+            Return a JSON object with exactly 3 news URLs in this exact format (no newlines or extra spaces):
             {{"sources":[{{"url":"url1","name":"name1","type":"type1","reliability":0.9}},{{"url":"url2","name":"name2","type":"type2","reliability":0.8}},{{"url":"url3","name":"name3","type":"type3","reliability":0.7}}]}}
             
             Rules:
-            1. Use this format for Yahoo Finance: https://finance.yahoo.com/quote/{ticker}/news?p={ticker}
-            2. Use this format for Reuters: https://www.reuters.com/markets/companies/{ticker}
-            3. Third source should be specialized for the instrument type (e.g., SeekingAlpha, MarketWatch, etc.)
-            4. No extra text or explanations, just the JSON
+            1. Prefer recent articles from the found URLs if they're high quality
+            2. Use this format for Yahoo Finance if needed: https://finance.yahoo.com/quote/{ticker}/news?p={ticker}
+            3. Use this format for Reuters if needed: https://www.reuters.com/markets/companies/{ticker}
+            4. Third source should be specialized for the instrument type (e.g., SeekingAlpha, MarketWatch, etc.)
+            5. No extra text or explanations, just the JSON
+            6. The URL should be the direct link to the page that displays the most possible news article
             """
 
             # Get response from Claude
             response = self.claude.with_config(run_name="get_news_sources").invoke(
-                news_sources_prompt.format(ticker=ticker)
+                news_sources_prompt
             )
             
             # Clean and parse JSON response
@@ -184,10 +226,10 @@ class EnhancedFinancialScanner:
             ]
             logger.warning(f"Falling back to default sources: {fallback_urls}")
             return fallback_urls
-
-    def scrape_financial_news(self, ticker: str) -> List[Dict[str, Any]]:
+    
+    def scrape_financial_news(self, ticker: str, timeframe: str) -> List[Dict[str, Any]]:
         """Scrape financial news from dynamically determined sources."""
-        news_sources = self.get_news_sources(ticker)
+        news_sources = self.get_news_sources(ticker, timeframe)
         logger.info(f"Scraping {len(news_sources)} news sources for {ticker}")
         
         news_items = []
@@ -352,43 +394,24 @@ class EnhancedFinancialScanner:
     def analyze_management_changes(self, ticker: str, timeframe: str) -> List[Dict[str, Any]]:
         """Track management changes from news articles."""
         try:
-            management_changes = []
+            # Use the events we already have instead of making new API calls
+            events = self.scrape_financial_events(ticker, timeframe)
             
-            # Keywords for management changes
-            mgmt_keywords = [
-                "ceo", "cfo", "president", "chairman",
-                "chief executive", "chief financial"
+            # Filter for management change events
+            management_changes = [
+                event for event in events 
+                if event.get('type') == 'Management Change'
             ]
             
-            # Get management changes from news
-            news = self.scrape_financial_news(ticker)
-            for article in news:
-                if any(keyword in article['title'].lower() for keyword in mgmt_keywords):
-                    management_changes.append({
-                        'date': article['date'],
-                        'type': 'News',
-                        'description': article['title'],
-                        'source': article.get('url', ''),
-                        'category': 'Management Change',
-                        'importance': 'High'
-                    })
-            
-            # Remove duplicates and sort
-            seen_events = set()
-            unique_changes = []
-            
-            for change in sorted(
-                management_changes, 
-                key=lambda x: datetime.strptime(x['date'], '%Y-%m-%d'), 
+            # Sort by date and limit to most recent
+            sorted_changes = sorted(
+                management_changes,
+                key=lambda x: x.get('parsed_date', ''),
                 reverse=True
-            ):
-                norm_desc = ' '.join(change['description'].lower().split())
-                if norm_desc not in seen_events:
-                    seen_events.add(norm_desc)
-                    unique_changes.append(change)
+            )[:10]  # Limit to 10 most recent changes
             
-            logger.info(f"Found {len(unique_changes)} management changes for {ticker}")
-            return unique_changes[:10]  # Limit to 10 most recent changes
+            logger.info(f"Found {len(sorted_changes)} management changes for {ticker}")
+            return sorted_changes
             
         except Exception as e:
             logger.error(f"Error analyzing management changes: {e}")
@@ -456,6 +479,7 @@ class EnhancedFinancialScanner:
             except Exception as e:
                 logger.error(f"Error getting component weight: {e}")
                 return 0.1
+            
     def scrape_financial_events(self, ticker: str, timeframe: str) -> List[Dict[str, Any]]:
         """Scrape financial events for a ticker and its components."""
         logger.info(f"Starting financial event scraping for {ticker} with timeframe {timeframe}")
@@ -465,83 +489,102 @@ class EnhancedFinancialScanner:
         components = self.get_ticker_components(ticker)
         logger.info(f"Processing {len(components)} components")
         
-        # Scrape news once and reuse for both events and management changes
+        # Keep track of processed components to prevent loops
+        processed_components = set()
+        
         for component in components:
+            if component in processed_components:
+                logger.info(f"Skipping already processed component: {component}")
+                continue
+                
+            processed_components.add(component)
             logger.info(f"\n==== Processing component: {component} ====")
             
             try:
-                # Get news articles
-                news_items = self.scrape_financial_news(component)
-                logger.info(f"Found {len(news_items)} news items for {component}")
+                # Get news articles directly without recursive calls
+                news_sources = self.get_news_sources(component, timeframe)
+                news_items = []
                 
-                # Process regular news items as events
+                for source in news_sources:
+                    try:
+                        time.sleep(1)  # Rate limiting
+                        
+                        news_data = self.firecrawl.scrape_url(
+                            source,
+                            params={
+                                'formats': ['markdown', 'extract'],
+                                'extract': {
+                                    'schema': {
+                                        'type': 'object',
+                                        'properties': {
+                                            'articles': {
+                                                'type': 'array',
+                                                'items': {
+                                                    'type': 'object',
+                                                    'properties': {
+                                                        'title': {'type': 'string'},
+                                                        'date': {'type': 'string'},
+                                                        'summary': {'type': 'string'},
+                                                        'url': {'type': 'string'},
+                                                        'source': {'type': 'string'}
+                                                    },
+                                                    'required': ['title']
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        )
+                        
+                        if news_data.get('extract', {}).get('articles'):
+                            news_items.extend(news_data['extract']['articles'])
+                        else:
+                            logger.warning(f"No articles found in response from {source}")
+                            
+                    except Exception as e:
+                        logger.error(f"Error scraping news from {source}: {e}")
+                        continue
+                
+                # Process articles into events
                 for article in news_items:
                     try:
-                        parsed_date = self.parse_date(article['date'])
+                        parsed_date = self.parse_date(article.get('date'))
                         if parsed_date:
                             formatted_date = parsed_date.strftime('%Y-%m-%d')
                             
-                            events.append({
+                            # Basic event
+                            event = {
                                 'date': formatted_date,
-                                'title': article['title'],
+                                'title': article.get('title', ''),
                                 'description': article.get('summary', 'No summary available'),
                                 'company': component,
                                 'type': 'News',
                                 'url': article.get('url', ''),
-                                'sentiment': article.get('sentiment', {}),
+                                'sentiment': self.analyze_sentiment(article.get('title', '')),
                                 'parsed_date': formatted_date
-                            })
-                    except Exception as e:
-                        logger.error(f"Error processing news article: {e}")
-                        continue
-                
-                # Process management changes
-                mgmt_keywords = ["ceo", "cfo", "president", "chairman", "chief executive", "chief financial"]
-                for article in news_items:
-                    if any(keyword in article['title'].lower() for keyword in mgmt_keywords):
-                        try:
-                            parsed_date = self.parse_date(article['date'])
-                            if parsed_date:
-                                formatted_date = parsed_date.strftime('%Y-%m-%d')
-                                
-                                events.append({
-                                    'date': formatted_date,
-                                    'title': article['title'],
-                                    'description': article.get('summary', article['title']),
-                                    'company': component,
-                                    'type': 'Management Change',
-                                    'url': article.get('url', ''),
-                                    'importance': 'High',
-                                    'parsed_date': formatted_date
-                                })
-                        except Exception as e:
-                            logger.error(f"Error processing management change: {e}")
-                            continue
+                            }
                             
+                            # Check for management changes
+                            mgmt_keywords = ["ceo", "cfo", "president", "chairman", "chief executive", "chief financial"]
+                            if any(keyword in article.get('title', '').lower() for keyword in mgmt_keywords):
+                                event.update({
+                                    'type': 'Management Change',
+                                    'importance': 'High'
+                                })
+                            
+                            events.append(event)
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing article: {e}")
+                        continue
+                        
             except Exception as e:
                 logger.error(f"Error processing component {component}: {e}")
                 continue
         
         # Filter events by timeframe
-        filtered_events = []
-        try:
-            now = datetime.now()
-            days = self.timeframe_to_days(timeframe)
-            cutoff_date = now - timedelta(days=days)
-            
-            for event in events:
-                try:
-                    event_date = datetime.strptime(event['date'], '%Y-%m-%d')
-                    if cutoff_date <= event_date <= now:
-                        filtered_events.append(event)
-                except Exception as e:
-                    logger.error(f"Error filtering event: {e}")
-                    continue
-            
-            logger.info(f"Filtered {len(events)} events to {len(filtered_events)} within timeframe")
-        except Exception as e:
-            logger.error(f"Error in timeframe filtering: {e}")
-            filtered_events = events
+        filtered_events = self.filter_events_by_timeframe(events, timeframe)
         
         # Analyze events in batches
         analyzed_events = []
@@ -561,13 +604,7 @@ class EnhancedFinancialScanner:
             
         except Exception as e:
             logger.error(f"Error in batch analysis: {e}")
-            # Fall back to unanalyzed events with default importance
-            analyzed_events = [{
-                **event,
-                'importance': 'Low',
-                'analysis': 'Error analyzing importance',
-                'key_factors': []
-            } for event in filtered_events]
+            analyzed_events = filtered_events  # Fall back to filtered events without analysis
         
         logger.info(f"Found {len(analyzed_events)} analyzed events")
         return analyzed_events
@@ -1006,120 +1043,143 @@ def create_enhanced_gradio_interface():
             submit_btn = gr.Button("Run Analysis", variant="primary")
 
         def run_analysis(ticker, timeframe, event_filters, min_imp):
-                    scanner = EnhancedFinancialScanner()
+            scanner = EnhancedFinancialScanner()
+            try:
+                # 1. First collect all base news and event data
+                logger.info(f"Starting initial data collection for {ticker}")
+                news_data = scanner.scrape_financial_news(ticker, timeframe)
+                
+                # 2. Process events from the news data we already have
+                events = []
+                for article in news_data:
                     try:
-                        # Hoofdanalyse
-                        events = scanner.scrape_financial_events(ticker, timeframe)
-                        
-                        # Filter events
-                        if event_filters:
-                            analyzed_events = [
-                                event for event in events 
-                                if event['type'] in event_filters and 
-                                float(event.get('importance_score', 0)) >= min_imp
-                            ]
-                        else:
-                            analyzed_events = events
-                        
-                        # Competitor analyse
-                        comp_analysis = scanner.analyze_competitors(ticker)
-                        
-                        # News analyse
-                        news = scanner.scrape_financial_news(ticker)
-                        
-                        # Management changes
-                        mgmt_changes = scanner.analyze_management_changes(ticker, timeframe)
-                        
-                        # Create summary
-                        summary = scanner.create_summary(analyzed_events, comp_analysis, news)
-                        
-                        # Create complete data dictionary
-                        all_data = {
-                            'ticker': ticker,
-                            'events': analyzed_events,
-                            'competitor_analysis': comp_analysis,
-                            'news': news,
-                            'management_changes': mgmt_changes,
-                            'summary': summary,
-                            'timestamp': datetime.now().isoformat()
-                        }
-                        
-                        # Prepare display data for events
-                        events_df = pd.DataFrame([{
-                            'Date': event.get('date', ''),
-                            'Event': event.get('title', ''),
-                            'Company': event.get('company', ''),
-                            'Importance': event.get('importance', 'Low'),
-                            'Analysis': event.get('analysis', '')
-                        } for event in analyzed_events])
-                        
-                        # Prepare display data for management changes
-                        mgmt_df = pd.DataFrame([{
-                            'Date': change.get('date', ''),
-                            'Title': change.get('title', ''),
-                            'Description': change.get('description', ''),
-                            'Source': change.get('source', ''),
-                            'Importance': change.get('importance', 'High')
-                        } for change in mgmt_changes])
-                        
-                        # Prepare display data for news
-                        news_df = pd.DataFrame([{
-                            'Date': article.get('date', ''),
-                            'Title': article.get('title', ''),
-                            'Summary': article.get('summary', ''),
-                            'Source': article.get('source_domain', ''),
-                            'Sentiment': f"Pos: {article.get('sentiment', {}).get('positive', 0):.2f}, Neg: {article.get('sentiment', {}).get('negative', 0):.2f}"
-                        } for article in news])
-                        
-                        # Create sentiment chart
-                        sentiment_fig = create_sentiment_chart(news)
-                        
-                        # Calculate priority flag
-                        flag_text = (
-                            "🔴 High Priority" if any(e.get('importance') == 'High' for e in analyzed_events)
-                            else "🟡 Medium Priority" if any(e.get('importance') == 'Medium' for e in analyzed_events)
-                            else "🟢 Low Priority"
-                        )
-                        
-                        # Ensure DataFrames are not empty
-                        if events_df.empty:
-                            events_df = pd.DataFrame(columns=['Date', 'Event', 'Company', 'Importance', 'Analysis'])
-                        if mgmt_df.empty:
-                            mgmt_df = pd.DataFrame(columns=['Date', 'Title', 'Description', 'Source', 'Importance'])
-                        if news_df.empty:
-                            news_df = pd.DataFrame(columns=['Date', 'Title', 'Summary', 'Source', 'Sentiment'])
-                        
-                        return (
-                            all_data,
-                            events_df,
-                            comp_analysis['competitor_info'],
-                            pd.DataFrame(comp_analysis['comparison_data']),
-                            news_df,
-                            sentiment_fig,
-                            mgmt_df,
-                            summary,
-                            flag_text
-                        )
-                        
+                        parsed_date = scanner.parse_date(article.get('date'))
+                        if parsed_date:
+                            formatted_date = parsed_date.strftime('%Y-%m-%d')
+                            
+                            event = {
+                                'date': formatted_date,
+                                'title': article.get('title', ''),
+                                'description': article.get('summary', 'No summary available'),
+                                'company': ticker,
+                                'type': 'News',
+                                'url': article.get('url', ''),
+                                'sentiment': article.get('sentiment', {}),
+                                'parsed_date': formatted_date
+                            }
+                            
+                            # Check for management changes in same pass
+                            mgmt_keywords = ["ceo", "cfo", "president", "chairman", "chief executive", "chief financial"]
+                            if any(keyword in article.get('title', '').lower() for keyword in mgmt_keywords):
+                                event.update({
+                                    'type': 'Management Change',
+                                    'importance': 'High'
+                                })
+                            
+                            events.append(event)
                     except Exception as e:
-                        logger.error(f"Error in analysis: {e}")
-                        # Return empty DataFrames with correct columns on error
-                        empty_events_df = pd.DataFrame(columns=['Date', 'Event', 'Company', 'Importance', 'Analysis'])
-                        empty_news_df = pd.DataFrame(columns=['Date', 'Title', 'Summary', 'Source', 'Sentiment'])
-                        empty_mgmt_df = pd.DataFrame(columns=['Date', 'Title', 'Description', 'Source', 'Importance'])
-                        empty_comp_df = pd.DataFrame(columns=['Metric', 'Value'])
-                        
-                        return (
-                            {},
-                            empty_events_df,
-                            {},
-                            empty_comp_df,
-                            empty_news_df,
-                            None,
-                            empty_mgmt_df,
-                            f"Error during analysis: {str(e)}",
-                            "⚠️ Analysis Error"
-                        )
+                        logger.error(f"Error processing article into event: {e}")
+                        continue
+
+                # 3. Filter and analyze events
+                if event_filters:
+                    filtered_events = [
+                        event for event in events 
+                        if event['type'] in event_filters and 
+                        float(event.get('importance_score', 0)) >= min_imp
+                    ]
+                else:
+                    filtered_events = events
+                    
+                # 4. Analyze competitors once
+                comp_analysis = scanner.analyze_competitors(ticker)
+                
+                # 5. Extract management changes from already processed events
+                mgmt_changes = [
+                    event for event in filtered_events 
+                    if event.get('type') == 'Management Change'
+                ]
+                
+                # 6. Create summary using the data we already have
+                summary = scanner.create_summary(filtered_events, comp_analysis, news_data)
+                
+                # 7. Prepare display data
+                all_data = {
+                    'ticker': ticker,
+                    'events': filtered_events,
+                    'competitor_analysis': comp_analysis,
+                    'news': news_data,
+                    'management_changes': mgmt_changes,
+                    'summary': summary,
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                # Convert to DataFrames for display
+                events_df = pd.DataFrame([{
+                    'Date': event.get('date', ''),
+                    'Event': event.get('title', ''),
+                    'Company': event.get('company', ''),
+                    'Importance': event.get('importance', 'Low'),
+                    'Analysis': event.get('analysis', '')
+                } for event in filtered_events])
+                
+                mgmt_df = pd.DataFrame([{
+                    'Date': change.get('date', ''),
+                    'Title': change.get('title', ''),
+                    'Description': change.get('description', ''),
+                    'Source': change.get('url', ''),
+                    'Importance': change.get('importance', 'High')
+                } for change in mgmt_changes])
+                
+                news_df = pd.DataFrame([{
+                    'Date': article.get('date', ''),
+                    'Title': article.get('title', ''),
+                    'Summary': article.get('summary', ''),
+                    'Source': article.get('source_domain', ''),
+                    'Sentiment': f"Pos: {article.get('sentiment', {}).get('positive', 0):.2f}, Neg: {article.get('sentiment', {}).get('negative', 0):.2f}"
+                } for article in news_data])
+                
+                # Calculate priority flag
+                flag_text = (
+                    "🔴 High Priority" if any(e.get('importance') == 'High' for e in filtered_events)
+                    else "🟡 Medium Priority" if any(e.get('importance') == 'Medium' for e in filtered_events)
+                    else "🟢 Low Priority"
+                )
+                
+                return (
+                    all_data,
+                    events_df,
+                    comp_analysis['competitor_info'],
+                    pd.DataFrame(comp_analysis['comparison_data']),
+                    news_df,
+                    create_sentiment_chart(news_data),
+                    mgmt_df,
+                    summary,
+                    flag_text
+                )
+                
+            except Exception as e:
+                logger.error(f"Error in analysis: {e}")
+                return create_empty_response()  # Return empty dataframes with correct structure
+
+        def create_empty_response():
+            """Create empty response with correct structure when analysis fails."""
+            empty_events_df = pd.DataFrame(columns=['Date', 'Event', 'Company', 'Importance', 'Analysis'])
+            empty_news_df = pd.DataFrame(columns=['Date', 'Title', 'Summary', 'Source', 'Sentiment'])
+            empty_mgmt_df = pd.DataFrame(columns=['Date', 'Title', 'Description', 'Source', 'Importance'])
+            empty_comp_df = pd.DataFrame(columns=['Metric', 'Value'])
+            
+            return (
+                {},
+                empty_events_df,
+                {},
+                empty_comp_df,
+                empty_news_df,
+                None,
+                empty_mgmt_df,
+                "Error during analysis. Please try again.",
+                "⚠️ Analysis Error"
+            )
 
         def create_sentiment_chart(news_data):
                     if not news_data:
